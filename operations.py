@@ -1,364 +1,696 @@
 import datetime
 import decimal
-import uuid
-from functools import lru_cache
-from itertools import chain
+from importlib import import_module
+
+import sqlparse
 
 from django.conf import settings
-from django.core.exceptions import FieldError
-from django.db import DatabaseError, NotSupportedError, models
-from django.db.backends.base.operations import BaseDatabaseOperations
-from django.db.models.expressions import Col
+from django.db import NotSupportedError, transaction
+from django.db.backends import utils
 from django.utils import timezone
-from django.utils.dateparse import parse_date, parse_datetime, parse_time
-from django.utils.functional import cached_property
+from django.utils.encoding import force_str
+from django.utils.regex_helper import _lazy_re_compile
 
 
-class DatabaseOperations(BaseDatabaseOperations):
-    cast_char_field_without_max_length = 'text'
-    cast_data_types = {
-        'DateField': 'TEXT',
-        'DateTimeField': 'TEXT',
+class BaseDatabaseOperations:
+    """
+    Encapsulate backend-specific differences, such as the way a backend
+    performs ordering or calculates the ID of a recently-inserted row.
+    """
+    compiler_module = "django.db.models.sql.compiler"
+
+    # Integer field safe ranges by `internal_type` as documented
+    # in docs/ref/models/fields.txt.
+    integer_field_ranges = {
+        'SmallIntegerField': (-32768, 32767),
+        'IntegerField': (-2147483648, 2147483647),
+        'BigIntegerField': (-9223372036854775808, 9223372036854775807),
+        'PositiveBigIntegerField': (0, 9223372036854775807),
+        'PositiveSmallIntegerField': (0, 32767),
+        'PositiveIntegerField': (0, 2147483647),
+        'SmallAutoField': (-32768, 32767),
+        'AutoField': (-2147483648, 2147483647),
+        'BigAutoField': (-9223372036854775808, 9223372036854775807),
     }
-    explain_prefix = 'EXPLAIN QUERY PLAN'
+    set_operators = {
+        'union': 'UNION',
+        'intersection': 'INTERSECT',
+        'difference': 'EXCEPT',
+    }
+    # Mapping of Field.get_internal_type() (typically the model field's class
+    # name) to the data type to use for the Cast() function, if different from
+    # DatabaseWrapper.data_types.
+    cast_data_types = {}
+    # CharField data type if the max_length argument isn't provided.
+    cast_char_field_without_max_length = None
+
+    # Start and end points for window expressions.
+    PRECEDING = 'PRECEDING'
+    FOLLOWING = 'FOLLOWING'
+    UNBOUNDED_PRECEDING = 'UNBOUNDED ' + PRECEDING
+    UNBOUNDED_FOLLOWING = 'UNBOUNDED ' + FOLLOWING
+    CURRENT_ROW = 'CURRENT ROW'
+
+    # Prefix for EXPLAIN queries, or None EXPLAIN isn't supported.
+    explain_prefix = None
+
+    extract_trunc_lookup_pattern = _lazy_re_compile(r"[\w\-_()]+")
+
+    def __init__(self, connection):
+        self.connection = connection
+        self._cache = None
+
+    def autoinc_sql(self, table, column):
+        """
+        Return any SQL needed to support auto-incrementing primary keys, or
+        None if no SQL is necessary.
+
+        This SQL is executed when a table is created.
+        """
+        return None
 
     def bulk_batch_size(self, fields, objs):
         """
-        SQLite has a compile-time default (SQLITE_LIMIT_VARIABLE_NUMBER) of
-        999 variables per query.
-
-        If there's only a single field to insert, the limit is 500
-        (SQLITE_MAX_COMPOUND_SELECT).
+        Return the maximum allowed batch size for the backend. The fields
+        are the fields going to be inserted in the batch, the objs contains
+        all the objects to be inserted.
         """
-        if len(fields) == 1:
-            return 500
-        elif len(fields) > 1:
-            return self.connection.features.max_query_params // len(fields)
-        else:
-            return len(objs)
+        return len(objs)
 
-    def check_expression_support(self, expression):
-        bad_fields = (models.DateField, models.DateTimeField, models.TimeField)
-        bad_aggregates = (models.Sum, models.Avg, models.Variance, models.StdDev)
-        if isinstance(expression, bad_aggregates):
-            for expr in expression.get_source_expressions():
-                try:
-                    output_field = expr.output_field
-                except (AttributeError, FieldError):
-                    # Not every subexpression has an output_field which is fine
-                    # to ignore.
-                    pass
-                else:
-                    if isinstance(output_field, bad_fields):
-                        raise NotSupportedError(
-                            'You cannot use Sum, Avg, StdDev, and Variance '
-                            'aggregations on date/time fields in sqlite3 '
-                            'since date/time is saved as text.'
-                        )
-        if (
-            isinstance(expression, models.Aggregate) and
-            expression.distinct and
-            len(expression.source_expressions) > 1
-        ):
-            raise NotSupportedError(
-                "SQLite doesn't support DISTINCT on aggregate functions "
-                "accepting multiple arguments."
-            )
+    def cache_key_culling_sql(self):
+        """
+        Return an SQL query that retrieves the first cache key greater than the
+        n smallest.
+
+        This is used by the 'db' cache backend to determine where to start
+        culling.
+        """
+        return "SELECT cache_key FROM %s ORDER BY cache_key LIMIT 1 OFFSET %%s"
+
+    def unification_cast_sql(self, output_field):
+        """
+        Given a field instance, return the SQL that casts the result of a union
+        to that type. The resulting string should contain a '%s' placeholder
+        for the expression being cast.
+        """
+        return '%s'
 
     def date_extract_sql(self, lookup_type, field_name):
         """
-        Support EXTRACT with a user-defined function django_date_extract()
-        that's registered in connect(). Use single quotes because this is a
-        string and could otherwise cause a collision with a field name.
+        Given a lookup_type of 'year', 'month', or 'day', return the SQL that
+        extracts a value from the given date field field_name.
         """
-        return "django_date_extract('%s', %s)" % (lookup_type.lower(), field_name)
-
-    def format_for_duration_arithmetic(self, sql):
-        """Do nothing since formatting is handled in the custom function."""
-        return sql
+        raise NotImplementedError('subclasses of BaseDatabaseOperations may require a date_extract_sql() method')
 
     def date_trunc_sql(self, lookup_type, field_name, tzname=None):
-        return "django_date_trunc('%s', %s, %s, %s)" % (
-            lookup_type.lower(),
-            field_name,
-            *self._convert_tznames_to_sql(tzname),
-        )
+        """
+        Given a lookup_type of 'year', 'month', or 'day', return the SQL that
+        truncates the given date or datetime field field_name to a date object
+        with only the given specificity.
 
-    def time_trunc_sql(self, lookup_type, field_name, tzname=None):
-        return "django_time_trunc('%s', %s, %s, %s)" % (
-            lookup_type.lower(),
-            field_name,
-            *self._convert_tznames_to_sql(tzname),
-        )
-
-    def _convert_tznames_to_sql(self, tzname):
-        if tzname and settings.USE_TZ:
-            return "'%s'" % tzname, "'%s'" % self.connection.timezone_name
-        return 'NULL', 'NULL'
+        If `tzname` is provided, the given value is truncated in a specific
+        timezone.
+        """
+        raise NotImplementedError('subclasses of BaseDatabaseOperations may require a date_trunc_sql() method.')
 
     def datetime_cast_date_sql(self, field_name, tzname):
-        return 'django_datetime_cast_date(%s, %s, %s)' % (
-            field_name, *self._convert_tznames_to_sql(tzname),
+        """
+        Return the SQL to cast a datetime value to date value.
+        """
+        raise NotImplementedError(
+            'subclasses of BaseDatabaseOperations may require a '
+            'datetime_cast_date_sql() method.'
         )
 
     def datetime_cast_time_sql(self, field_name, tzname):
-        return 'django_datetime_cast_time(%s, %s, %s)' % (
-            field_name, *self._convert_tznames_to_sql(tzname),
-        )
+        """
+        Return the SQL to cast a datetime value to time value.
+        """
+        raise NotImplementedError('subclasses of BaseDatabaseOperations may require a datetime_cast_time_sql() method')
 
     def datetime_extract_sql(self, lookup_type, field_name, tzname):
-        return "django_datetime_extract('%s', %s, %s, %s)" % (
-            lookup_type.lower(), field_name, *self._convert_tznames_to_sql(tzname),
-        )
+        """
+        Given a lookup_type of 'year', 'month', 'day', 'hour', 'minute', or
+        'second', return the SQL that extracts a value from the given
+        datetime field field_name.
+        """
+        raise NotImplementedError('subclasses of BaseDatabaseOperations may require a datetime_extract_sql() method')
 
     def datetime_trunc_sql(self, lookup_type, field_name, tzname):
-        return "django_datetime_trunc('%s', %s, %s, %s)" % (
-            lookup_type.lower(), field_name, *self._convert_tznames_to_sql(tzname),
-        )
+        """
+        Given a lookup_type of 'year', 'month', 'day', 'hour', 'minute', or
+        'second', return the SQL that truncates the given datetime field
+        field_name to a datetime object with only the given specificity.
+        """
+        raise NotImplementedError('subclasses of BaseDatabaseOperations may require a datetime_trunc_sql() method')
+
+    def time_trunc_sql(self, lookup_type, field_name, tzname=None):
+        """
+        Given a lookup_type of 'hour', 'minute' or 'second', return the SQL
+        that truncates the given time or datetime field field_name to a time
+        object with only the given specificity.
+
+        If `tzname` is provided, the given value is truncated in a specific
+        timezone.
+        """
+        raise NotImplementedError('subclasses of BaseDatabaseOperations may require a time_trunc_sql() method')
 
     def time_extract_sql(self, lookup_type, field_name):
-        return "django_time_extract('%s', %s)" % (lookup_type.lower(), field_name)
-
-    def pk_default_value(self):
-        return "NULL"
-
-    def _quote_params_for_last_executed_query(self, params):
         """
-        Only for last_executed_query! Don't use this to execute SQL queries!
+        Given a lookup_type of 'hour', 'minute', or 'second', return the SQL
+        that extracts a value from the given time field field_name.
         """
-        # This function is limited both by SQLITE_LIMIT_VARIABLE_NUMBER (the
-        # number of parameters, default = 999) and SQLITE_MAX_COLUMN (the
-        # number of return values, default = 2000). Since Python's sqlite3
-        # module doesn't expose the get_limit() C API, assume the default
-        # limits are in effect and split the work in batches if needed.
-        BATCH_SIZE = 999
-        if len(params) > BATCH_SIZE:
-            results = ()
-            for index in range(0, len(params), BATCH_SIZE):
-                chunk = params[index:index + BATCH_SIZE]
-                results += self._quote_params_for_last_executed_query(chunk)
-            return results
+        return self.date_extract_sql(lookup_type, field_name)
 
-        sql = 'SELECT ' + ', '.join(['QUOTE(?)'] * len(params))
-        # Bypass Django's wrappers and use the underlying sqlite3 connection
-        # to avoid logging this query - it would trigger infinite recursion.
-        cursor = self.connection.connection.cursor()
-        # Native sqlite3 cursors cannot be used as context managers.
-        try:
-            return cursor.execute(sql, params).fetchone()
-        finally:
-            cursor.close()
+    def deferrable_sql(self):
+        """
+        Return the SQL to make a constraint "initially deferred" during a
+        CREATE TABLE statement.
+        """
+        return ''
+
+    def distinct_sql(self, fields, params):
+        """
+        Return an SQL DISTINCT clause which removes duplicate rows from the
+        result set. If any fields are given, only check the given fields for
+        duplicates.
+        """
+        if fields:
+            raise NotSupportedError('DISTINCT ON fields is not supported by this database backend')
+        else:
+            return ['DISTINCT'], []
+
+    def fetch_returned_insert_columns(self, cursor, returning_params):
+        """
+        Given a cursor object that has just performed an INSERT...RETURNING
+        statement into a table, return the newly created data.
+        """
+        return cursor.fetchone()
+
+    def field_cast_sql(self, db_type, internal_type):
+        """
+        Given a column type (e.g. 'BLOB', 'VARCHAR') and an internal type
+        (e.g. 'GenericIPAddressField'), return the SQL to cast it before using
+        it in a WHERE statement. The resulting string should contain a '%s'
+        placeholder for the column being searched against.
+        """
+        return '%s'
+
+    def force_no_ordering(self):
+        """
+        Return a list used in the "ORDER BY" clause to force no ordering at
+        all. Return an empty list to include nothing in the ordering.
+        """
+        return []
+
+    def for_update_sql(self, nowait=False, skip_locked=False, of=(), no_key=False):
+        """
+        Return the FOR UPDATE SQL clause to lock rows for an update operation.
+        """
+        return 'FOR%s UPDATE%s%s%s' % (
+            ' NO KEY' if no_key else '',
+            ' OF %s' % ', '.join(of) if of else '',
+            ' NOWAIT' if nowait else '',
+            ' SKIP LOCKED' if skip_locked else '',
+        )
+
+    def _get_limit_offset_params(self, low_mark, high_mark):
+        offset = low_mark or 0
+        if high_mark is not None:
+            return (high_mark - offset), offset
+        elif offset:
+            return self.connection.ops.no_limit_value(), offset
+        return None, offset
+
+    def limit_offset_sql(self, low_mark, high_mark):
+        """Return LIMIT/OFFSET SQL clause."""
+        limit, offset = self._get_limit_offset_params(low_mark, high_mark)
+        return ' '.join(sql for sql in (
+            ('LIMIT %d' % limit) if limit else None,
+            ('OFFSET %d' % offset) if offset else None,
+        ) if sql)
 
     def last_executed_query(self, cursor, sql, params):
-        # Python substitutes parameters in Modules/_sqlite/cursor.c with:
-        # pysqlite_statement_bind_parameters(self->statement, parameters, allow_8bit_chars);
-        # Unfortunately there is no way to reach self->statement from Python,
-        # so we quote and substitute parameters manually.
-        if params:
-            if isinstance(params, (list, tuple)):
-                params = self._quote_params_for_last_executed_query(params)
-            else:
-                values = tuple(params.values())
-                values = self._quote_params_for_last_executed_query(values)
-                params = dict(zip(params, values))
-            return sql % params
-        # For consistency with SQLiteCursorWrapper.execute(), just return sql
-        # when there are no parameters. See #13648 and #17158.
-        else:
-            return sql
+        """
+        Return a string of the query last executed by the given cursor, with
+        placeholders replaced with actual values.
 
-    def quote_name(self, name):
-        if name.startswith('"') and name.endswith('"'):
-            return name  # Quoting once is enough.
-        return '"%s"' % name
+        `sql` is the raw query containing placeholders and `params` is the
+        sequence of parameters. These are used by default, but this method
+        exists for database backends to provide a better implementation
+        according to their own quoting schemes.
+        """
+        # Convert params to contain string values.
+        def to_string(s):
+            return force_str(s, strings_only=True, errors='replace')
+        if isinstance(params, (list, tuple)):
+            u_params = tuple(to_string(val) for val in params)
+        elif params is None:
+            u_params = ()
+        else:
+            u_params = {to_string(k): to_string(v) for k, v in params.items()}
+
+        return "QUERY = %r - PARAMS = %r" % (sql, u_params)
+
+    def last_insert_id(self, cursor, table_name, pk_name):
+        """
+        Given a cursor object that has just performed an INSERT statement into
+        a table that has an auto-incrementing ID, return the newly created ID.
+
+        `pk_name` is the name of the primary-key column.
+        """
+        return cursor.lastrowid
+
+    def lookup_cast(self, lookup_type, internal_type=None):
+        """
+        Return the string to use in a query when performing lookups
+        ("contains", "like", etc.). It should contain a '%s' placeholder for
+        the column being searched against.
+        """
+        return "%s"
+
+    def max_in_list_size(self):
+        """
+        Return the maximum number of items that can be passed in a single 'IN'
+        list condition, or None if the backend does not impose a limit.
+        """
+        return None
+
+    def max_name_length(self):
+        """
+        Return the maximum length of table and column names, or None if there
+        is no limit.
+        """
+        return None
 
     def no_limit_value(self):
-        return -1
-
-    def __references_graph(self, table_name):
-        query = """
-        WITH tables AS (
-            SELECT %s name
-            UNION
-            SELECT sqlite_master.name
-            FROM sqlite_master
-            JOIN tables ON (sql REGEXP %s || tables.name || %s)
-        ) SELECT name FROM tables;
         """
-        params = (
-            table_name,
-            r'(?i)\s+references\s+("|\')?',
-            r'("|\')?\s*\(',
-        )
-        with self.connection.cursor() as cursor:
-            results = cursor.execute(query, params)
-            return [row[0] for row in results.fetchall()]
+        Return the value to use for the LIMIT when we are wanting "LIMIT
+        infinity". Return None if the limit clause can be omitted in this case.
+        """
+        raise NotImplementedError('subclasses of BaseDatabaseOperations may require a no_limit_value() method')
 
-    @cached_property
-    def _references_graph(self):
-        # 512 is large enough to fit the ~330 tables (as of this writing) in
-        # Django's test suite.
-        return lru_cache(maxsize=512)(self.__references_graph)
+    def pk_default_value(self):
+        """
+        Return the value to use during an INSERT statement to specify that
+        the field should use its default value.
+        """
+        return 'DEFAULT'
 
-    def sql_flush(self, style, tables, *, reset_sequences=False, allow_cascade=False):
-        if tables and allow_cascade:
-            # Simulate TRUNCATE CASCADE by recursively collecting the tables
-            # referencing the tables to be flushed.
-            tables = set(chain.from_iterable(self._references_graph(table) for table in tables))
-        sql = ['%s %s %s;' % (
-            style.SQL_KEYWORD('DELETE'),
-            style.SQL_KEYWORD('FROM'),
-            style.SQL_FIELD(self.quote_name(table))
-        ) for table in tables]
-        if reset_sequences:
-            sequences = [{'table': table} for table in tables]
-            sql.extend(self.sequence_reset_by_name_sql(style, sequences))
-        return sql
+    def prepare_sql_script(self, sql):
+        """
+        Take an SQL script that may contain multiple lines and return a list
+        of statements to feed to successive cursor.execute() calls.
 
-    def sequence_reset_by_name_sql(self, style, sequences):
-        if not sequences:
-            return []
+        Since few databases are able to process raw SQL scripts in a single
+        cursor.execute() call and PEP 249 doesn't talk about this use case,
+        the default implementation is conservative.
+        """
         return [
-            '%s %s %s %s = 0 %s %s %s (%s);' % (
-                style.SQL_KEYWORD('UPDATE'),
-                style.SQL_TABLE(self.quote_name('sqlite_sequence')),
-                style.SQL_KEYWORD('SET'),
-                style.SQL_FIELD(self.quote_name('seq')),
-                style.SQL_KEYWORD('WHERE'),
-                style.SQL_FIELD(self.quote_name('name')),
-                style.SQL_KEYWORD('IN'),
-                ', '.join([
-                    "'%s'" % sequence_info['table'] for sequence_info in sequences
-                ]),
-            ),
+            sqlparse.format(statement, strip_comments=True)
+            for statement in sqlparse.split(sql) if statement
         ]
 
-    def adapt_datetimefield_value(self, value):
-        if value is None:
-            return None
+    def process_clob(self, value):
+        """
+        Return the value of a CLOB column, for backends that return a locator
+        object that requires additional processing.
+        """
+        return value
 
-        # Expression values are adapted by the database.
-        if hasattr(value, 'resolve_expression'):
+    def return_insert_columns(self, fields):
+        """
+        For backends that support returning columns as part of an insert query,
+        return the SQL and params to append to the INSERT query. The returned
+        fragment should contain a format string to hold the appropriate column.
+        """
+        pass
+
+    def compiler(self, compiler_name):
+        """
+        Return the SQLCompiler class corresponding to the given name,
+        in the namespace corresponding to the `compiler_module` attribute
+        on this backend.
+        """
+        if self._cache is None:
+            self._cache = import_module(self.compiler_module)
+        return getattr(self._cache, compiler_name)
+
+    def quote_name(self, name):
+        """
+        Return a quoted version of the given table, index, or column name. Do
+        not quote the given name if it's already been quoted.
+        """
+        raise NotImplementedError('subclasses of BaseDatabaseOperations may require a quote_name() method')
+
+    def regex_lookup(self, lookup_type):
+        """
+        Return the string to use in a query when performing regular expression
+        lookups (using "regex" or "iregex"). It should contain a '%s'
+        placeholder for the column being searched against.
+
+        If the feature is not supported (or part of it is not supported), raise
+        NotImplementedError.
+        """
+        raise NotImplementedError('subclasses of BaseDatabaseOperations may require a regex_lookup() method')
+
+    def savepoint_create_sql(self, sid):
+        """
+        Return the SQL for starting a new savepoint. Only required if the
+        "uses_savepoints" feature is True. The "sid" parameter is a string
+        for the savepoint id.
+        """
+        return "SAVEPOINT %s" % self.quote_name(sid)
+
+    def savepoint_commit_sql(self, sid):
+        """
+        Return the SQL for committing the given savepoint.
+        """
+        return "RELEASE SAVEPOINT %s" % self.quote_name(sid)
+
+    def savepoint_rollback_sql(self, sid):
+        """
+        Return the SQL for rolling back the given savepoint.
+        """
+        return "ROLLBACK TO SAVEPOINT %s" % self.quote_name(sid)
+
+    def set_time_zone_sql(self):
+        """
+        Return the SQL that will set the connection's time zone.
+
+        Return '' if the backend doesn't support time zones.
+        """
+        return ''
+
+    def sql_flush(self, style, tables, *, reset_sequences=False, allow_cascade=False):
+        """
+        Return a list of SQL statements required to remove all data from
+        the given database tables (without actually removing the tables
+        themselves).
+
+        The `style` argument is a Style object as returned by either
+        color_style() or no_style() in django.core.management.color.
+
+        If `reset_sequences` is True, the list includes SQL statements required
+        to reset the sequences.
+
+        The `allow_cascade` argument determines whether truncation may cascade
+        to tables with foreign keys pointing the tables being truncated.
+        PostgreSQL requires a cascade even if these tables are empty.
+        """
+        raise NotImplementedError('subclasses of BaseDatabaseOperations must provide an sql_flush() method')
+
+    def execute_sql_flush(self, sql_list):
+        """Execute a list of SQL statements to flush the database."""
+        with transaction.atomic(
+            using=self.connection.alias,
+            savepoint=self.connection.features.can_rollback_ddl,
+        ):
+            with self.connection.cursor() as cursor:
+                for sql in sql_list:
+                    cursor.execute(sql)
+
+    def sequence_reset_by_name_sql(self, style, sequences):
+        """
+        Return a list of the SQL statements required to reset sequences
+        passed in `sequences`.
+
+        The `style` argument is a Style object as returned by either
+        color_style() or no_style() in django.core.management.color.
+        """
+        return []
+
+    def sequence_reset_sql(self, style, model_list):
+        """
+        Return a list of the SQL statements required to reset sequences for
+        the given models.
+
+        The `style` argument is a Style object as returned by either
+        color_style() or no_style() in django.core.management.color.
+        """
+        return []  # No sequence reset required by default.
+
+    def start_transaction_sql(self):
+        """Return the SQL statement required to start a transaction."""
+        return "BEGIN;"
+
+    def end_transaction_sql(self, success=True):
+        """Return the SQL statement required to end a transaction."""
+        if not success:
+            return "ROLLBACK;"
+        return "COMMIT;"
+
+    def tablespace_sql(self, tablespace, inline=False):
+        """
+        Return the SQL that will be used in a query to define the tablespace.
+
+        Return '' if the backend doesn't support tablespaces.
+
+        If `inline` is True, append the SQL to a row; otherwise append it to
+        the entire CREATE TABLE or CREATE INDEX statement.
+        """
+        return ''
+
+    def prep_for_like_query(self, x):
+        """Prepare a value for use in a LIKE query."""
+        return str(x).replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
+
+    # Same as prep_for_like_query(), but called for "iexact" matches, which
+    # need not necessarily be implemented using "LIKE" in the backend.
+    prep_for_iexact_query = prep_for_like_query
+
+    def validate_autopk_value(self, value):
+        """
+        Certain backends do not accept some values for "serial" fields
+        (for example zero in MySQL). Raise a ValueError if the value is
+        invalid, otherwise return the validated value.
+        """
+        return value
+
+    def adapt_unknown_value(self, value):
+        """
+        Transform a value to something compatible with the backend driver.
+
+        This method only depends on the type of the value. It's designed for
+        cases where the target type isn't known, such as .raw() SQL queries.
+        As a consequence it may not work perfectly in all circumstances.
+        """
+        if isinstance(value, datetime.datetime):   # must be before date
+            return self.adapt_datetimefield_value(value)
+        elif isinstance(value, datetime.date):
+            return self.adapt_datefield_value(value)
+        elif isinstance(value, datetime.time):
+            return self.adapt_timefield_value(value)
+        elif isinstance(value, decimal.Decimal):
+            return self.adapt_decimalfield_value(value)
+        else:
             return value
 
-        # SQLite doesn't support tz-aware datetimes
-        if timezone.is_aware(value):
-            if settings.USE_TZ:
-                value = timezone.make_naive(value, self.connection.timezone)
-            else:
-                raise ValueError("SQLite backend does not support timezone-aware datetimes when USE_TZ is False.")
+    def adapt_datefield_value(self, value):
+        """
+        Transform a date value to an object compatible with what is expected
+        by the backend driver for date columns.
+        """
+        if value is None:
+            return None
+        return str(value)
 
+    def adapt_datetimefield_value(self, value):
+        """
+        Transform a datetime value to an object compatible with what is expected
+        by the backend driver for datetime columns.
+        """
+        if value is None:
+            return None
         return str(value)
 
     def adapt_timefield_value(self, value):
+        """
+        Transform a time value to an object compatible with what is expected
+        by the backend driver for time columns.
+        """
         if value is None:
             return None
-
-        # Expression values are adapted by the database.
-        if hasattr(value, 'resolve_expression'):
-            return value
-
-        # SQLite doesn't support tz-aware datetimes
         if timezone.is_aware(value):
-            raise ValueError("SQLite backend does not support timezone-aware times.")
-
+            raise ValueError("Django does not support timezone-aware times.")
         return str(value)
 
+    def adapt_decimalfield_value(self, value, max_digits=None, decimal_places=None):
+        """
+        Transform a decimal.Decimal value to an object compatible with what is
+        expected by the backend driver for decimal (numeric) columns.
+        """
+        return utils.format_number(value, max_digits, decimal_places)
+
+    def adapt_ipaddressfield_value(self, value):
+        """
+        Transform a string representation of an IP address into the expected
+        type for the backend driver.
+        """
+        return value or None
+
+    def year_lookup_bounds_for_date_field(self, value):
+        """
+        Return a two-elements list with the lower and upper bound to be used
+        with a BETWEEN operator to query a DateField value using a year
+        lookup.
+
+        `value` is an int, containing the looked-up year.
+        """
+        first = datetime.date(value, 1, 1)
+        second = datetime.date(value, 12, 31)
+        first = self.adapt_datefield_value(first)
+        second = self.adapt_datefield_value(second)
+        return [first, second]
+
+    def year_lookup_bounds_for_datetime_field(self, value):
+        """
+        Return a two-elements list with the lower and upper bound to be used
+        with a BETWEEN operator to query a DateTimeField value using a year
+        lookup.
+
+        `value` is an int, containing the looked-up year.
+        """
+        first = datetime.datetime(value, 1, 1)
+        second = datetime.datetime(value, 12, 31, 23, 59, 59, 999999)
+        if settings.USE_TZ:
+            tz = timezone.get_current_timezone()
+            first = timezone.make_aware(first, tz)
+            second = timezone.make_aware(second, tz)
+        first = self.adapt_datetimefield_value(first)
+        second = self.adapt_datetimefield_value(second)
+        return [first, second]
+
     def get_db_converters(self, expression):
-        converters = super().get_db_converters(expression)
-        internal_type = expression.output_field.get_internal_type()
-        if internal_type == 'DateTimeField':
-            converters.append(self.convert_datetimefield_value)
-        elif internal_type == 'DateField':
-            converters.append(self.convert_datefield_value)
-        elif internal_type == 'TimeField':
-            converters.append(self.convert_timefield_value)
-        elif internal_type == 'DecimalField':
-            converters.append(self.get_decimalfield_converter(expression))
-        elif internal_type == 'UUIDField':
-            converters.append(self.convert_uuidfield_value)
-        elif internal_type in ('NullBooleanField', 'BooleanField'):
-            converters.append(self.convert_booleanfield_value)
-        return converters
+        """
+        Return a list of functions needed to convert field data.
 
-    def convert_datetimefield_value(self, value, expression, connection):
+        Some field types on some backends do not provide data in the correct
+        format, this is the hook for converter functions.
+        """
+        return []
+
+    def convert_durationfield_value(self, value, expression, connection):
         if value is not None:
-            if not isinstance(value, datetime.datetime):
-                value = parse_datetime(value)
-            if settings.USE_TZ and not timezone.is_aware(value):
-                value = timezone.make_aware(value, self.connection.timezone)
-        return value
+            return datetime.timedelta(0, 0, value)
 
-    def convert_datefield_value(self, value, expression, connection):
-        if value is not None:
-            if not isinstance(value, datetime.date):
-                value = parse_date(value)
-        return value
+    def check_expression_support(self, expression):
+        """
+        Check that the backend supports the provided expression.
 
-    def convert_timefield_value(self, value, expression, connection):
-        if value is not None:
-            if not isinstance(value, datetime.time):
-                value = parse_time(value)
-        return value
+        This is used on specific backends to rule out known expressions
+        that have problematic or nonexistent implementations. If the
+        expression has a known problem, the backend should raise
+        NotSupportedError.
+        """
+        pass
 
-    def get_decimalfield_converter(self, expression):
-        # SQLite stores only 15 significant digits. Digits coming from
-        # float inaccuracy must be removed.
-        create_decimal = decimal.Context(prec=15).create_decimal_from_float
-        if isinstance(expression, Col):
-            quantize_value = decimal.Decimal(1).scaleb(-expression.output_field.decimal_places)
-
-            def converter(value, expression, connection):
-                if value is not None:
-                    return create_decimal(value).quantize(quantize_value, context=expression.output_field.context)
-        else:
-            def converter(value, expression, connection):
-                if value is not None:
-                    return create_decimal(value)
-        return converter
-
-    def convert_uuidfield_value(self, value, expression, connection):
-        if value is not None:
-            value = uuid.UUID(value)
-        return value
-
-    def convert_booleanfield_value(self, value, expression, connection):
-        return bool(value) if value in (1, 0) else value
-
-    def bulk_insert_sql(self, fields, placeholder_rows):
-        return " UNION ALL ".join(
-            "SELECT %s" % ", ".join(row)
-            for row in placeholder_rows
-        )
+    def conditional_expression_supported_in_where_clause(self, expression):
+        """
+        Return True, if the conditional expression is supported in the WHERE
+        clause.
+        """
+        return True
 
     def combine_expression(self, connector, sub_expressions):
-        # SQLite doesn't have a ^ operator, so use the user-defined POWER
-        # function that's registered in connect().
-        if connector == '^':
-            return 'POWER(%s)' % ','.join(sub_expressions)
-        elif connector == '#':
-            return 'BITXOR(%s)' % ','.join(sub_expressions)
-        return super().combine_expression(connector, sub_expressions)
+        """
+        Combine a list of subexpressions into a single expression, using
+        the provided connecting operator. This is required because operators
+        can vary between backends (e.g., Oracle with %% and &) and between
+        subexpression types (e.g., date expressions).
+        """
+        conn = ' %s ' % connector
+        return conn.join(sub_expressions)
 
     def combine_duration_expression(self, connector, sub_expressions):
-        if connector not in ['+', '-']:
-            raise DatabaseError('Invalid connector for timedelta: %s.' % connector)
-        fn_params = ["'%s'" % connector] + sub_expressions
-        if len(fn_params) > 3:
-            raise ValueError('Too many params for timedelta operations.')
-        return "django_format_dtdelta(%s)" % ', '.join(fn_params)
+        return self.combine_expression(connector, sub_expressions)
+
+    def binary_placeholder_sql(self, value):
+        """
+        Some backends require special syntax to insert binary content (MySQL
+        for example uses '_binary %s').
+        """
+        return '%s'
+
+    def modify_insert_params(self, placeholder, params):
+        """
+        Allow modification of insert parameters. Needed for Oracle Spatial
+        backend due to #10888.
+        """
+        return params
 
     def integer_field_range(self, internal_type):
-        # SQLite doesn't enforce any integer constraints
-        return (None, None)
+        """
+        Given an integer field internal type (e.g. 'PositiveIntegerField'),
+        return a tuple of the (min_value, max_value) form representing the
+        range of the column type bound to the field.
+        """
+        return self.integer_field_ranges[internal_type]
 
     def subtract_temporals(self, internal_type, lhs, rhs):
-        lhs_sql, lhs_params = lhs
-        rhs_sql, rhs_params = rhs
-        params = (*lhs_params, *rhs_params)
-        if internal_type == 'TimeField':
-            return 'django_time_diff(%s, %s)' % (lhs_sql, rhs_sql), params
-        return 'django_timestamp_diff(%s, %s)' % (lhs_sql, rhs_sql), params
+        if self.connection.features.supports_temporal_subtraction:
+            lhs_sql, lhs_params = lhs
+            rhs_sql, rhs_params = rhs
+            return '(%s - %s)' % (lhs_sql, rhs_sql), (*lhs_params, *rhs_params)
+        raise NotSupportedError("This backend does not support %s subtraction." % internal_type)
+
+    def window_frame_start(self, start):
+        if isinstance(start, int):
+            if start < 0:
+                return '%d %s' % (abs(start), self.PRECEDING)
+            elif start == 0:
+                return self.CURRENT_ROW
+        elif start is None:
+            return self.UNBOUNDED_PRECEDING
+        raise ValueError("start argument must be a negative integer, zero, or None, but got '%s'." % start)
+
+    def window_frame_end(self, end):
+        if isinstance(end, int):
+            if end == 0:
+                return self.CURRENT_ROW
+            elif end > 0:
+                return '%d %s' % (end, self.FOLLOWING)
+        elif end is None:
+            return self.UNBOUNDED_FOLLOWING
+        raise ValueError("end argument must be a positive integer, zero, or None, but got '%s'." % end)
+
+    def window_frame_rows_start_end(self, start=None, end=None):
+        """
+        Return SQL for start and end points in an OVER clause window frame.
+        """
+        if not self.connection.features.supports_over_clause:
+            raise NotSupportedError('This backend does not support window expressions.')
+        return self.window_frame_start(start), self.window_frame_end(end)
+
+    def window_frame_range_start_end(self, start=None, end=None):
+        start_, end_ = self.window_frame_rows_start_end(start, end)
+        if (
+            self.connection.features.only_supports_unbounded_with_preceding_and_following and
+            ((start and start < 0) or (end and end > 0))
+        ):
+            raise NotSupportedError(
+                '%s only supports UNBOUNDED together with PRECEDING and '
+                'FOLLOWING.' % self.connection.display_name
+            )
+        return start_, end_
+
+    def explain_query_prefix(self, format=None, **options):
+        if not self.connection.features.supports_explaining_query_execution:
+            raise NotSupportedError('This backend does not support explaining query execution.')
+        if format:
+            supported_formats = self.connection.features.supported_explain_formats
+            normalized_format = format.upper()
+            if normalized_format not in supported_formats:
+                msg = '%s is not a recognized format.' % normalized_format
+                if supported_formats:
+                    msg += ' Allowed formats: %s' % ', '.join(sorted(supported_formats))
+                raise ValueError(msg)
+        if options:
+            raise ValueError('Unknown options: %s' % ', '.join(sorted(options.keys())))
+        return self.explain_prefix
 
     def insert_statement(self, ignore_conflicts=False):
-        return 'INSERT OR IGNORE INTO' if ignore_conflicts else super().insert_statement(ignore_conflicts)
+        return 'INSERT INTO'
+
+    def ignore_conflicts_suffix_sql(self, ignore_conflicts=None):
+        return ''
