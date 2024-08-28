@@ -1,6 +1,21 @@
-"""
-Constants used across the ORM in general.
-"""
+DEBUG = 10
+INFO = 20
+SUCCESS = 25
+WARNING = 30
+ERROR = 40
 
-# Separator used to split filter strings apart.
-LOOKUP_SEP = '__'
+DEFAULT_TAGS = {
+    DEBUG: 'debug',
+    INFO: 'info',
+    SUCCESS: 'success',
+    WARNING: 'warning',
+    ERROR: 'error',
+}
+
+DEFAULT_LEVELS = {
+    'DEBUG': DEBUG,
+    'INFO': INFO,
+    'SUCCESS': SUCCESS,
+    'WARNING': WARNING,
+    'ERROR': ERROR,
+}

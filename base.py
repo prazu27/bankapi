@@ -1,179 +1,171 @@
-from urllib.parse import unquote, urlsplit, urlunsplit
+from django.conf import settings
+from django.contrib.messages import constants, utils
 
-from asgiref.local import Local
-
-from django.utils.functional import lazy
-from django.utils.translation import override
-
-from .exceptions import NoReverseMatch, Resolver404
-from .resolvers import _get_cached_resolver, get_ns_resolver, get_resolver
-from .utils import get_callable
-
-# SCRIPT_NAME prefixes for each thread are stored here. If there's no entry for
-# the current thread (which is the only one we ever access), it is assumed to
-# be empty.
-_prefixes = Local()
-
-# Overridden URLconfs for each thread are stored here.
-_urlconfs = Local()
+LEVEL_TAGS = utils.get_level_tags()
 
 
-def resolve(path, urlconf=None):
-    if urlconf is None:
-        urlconf = get_urlconf()
-    return get_resolver(urlconf).resolve(path)
+class Message:
+    """
+    Represent an actual message that can be stored in any of the supported
+    storage classes (typically session- or cookie-based) and rendered in a view
+    or template.
+    """
+
+    def __init__(self, level, message, extra_tags=None):
+        self.level = int(level)
+        self.message = message
+        self.extra_tags = extra_tags
+
+    def _prepare(self):
+        """
+        Prepare the message for serialization by forcing the ``message``
+        and ``extra_tags`` to str in case they are lazy translations.
+        """
+        self.message = str(self.message)
+        self.extra_tags = str(self.extra_tags) if self.extra_tags is not None else None
+
+    def __eq__(self, other):
+        if not isinstance(other, Message):
+            return NotImplemented
+        return self.level == other.level and self.message == other.message
+
+    def __str__(self):
+        return str(self.message)
+
+    @property
+    def tags(self):
+        return ' '.join(tag for tag in [self.extra_tags, self.level_tag] if tag)
+
+    @property
+    def level_tag(self):
+        return LEVEL_TAGS.get(self.level, '')
 
 
-def reverse(viewname, urlconf=None, args=None, kwargs=None, current_app=None):
-    if urlconf is None:
-        urlconf = get_urlconf()
-    resolver = get_resolver(urlconf)
-    args = args or []
-    kwargs = kwargs or {}
+class BaseStorage:
+    """
+    This is the base backend for temporary message storage.
 
-    prefix = get_script_prefix()
+    This is not a complete class; to be a usable storage backend, it must be
+    subclassed and the two methods ``_get`` and ``_store`` overridden.
+    """
 
-    if not isinstance(viewname, str):
-        view = viewname
-    else:
-        *path, view = viewname.split(':')
+    def __init__(self, request, *args, **kwargs):
+        self.request = request
+        self._queued_messages = []
+        self.used = False
+        self.added_new = False
+        super().__init__(*args, **kwargs)
 
-        if current_app:
-            current_path = current_app.split(':')
-            current_path.reverse()
+    def __len__(self):
+        return len(self._loaded_messages) + len(self._queued_messages)
+
+    def __iter__(self):
+        self.used = True
+        if self._queued_messages:
+            self._loaded_messages.extend(self._queued_messages)
+            self._queued_messages = []
+        return iter(self._loaded_messages)
+
+    def __contains__(self, item):
+        return item in self._loaded_messages or item in self._queued_messages
+
+    @property
+    def _loaded_messages(self):
+        """
+        Return a list of loaded messages, retrieving them first if they have
+        not been loaded yet.
+        """
+        if not hasattr(self, '_loaded_data'):
+            messages, all_retrieved = self._get()
+            self._loaded_data = messages or []
+        return self._loaded_data
+
+    def _get(self, *args, **kwargs):
+        """
+        Retrieve a list of stored messages. Return a tuple of the messages
+        and a flag indicating whether or not all the messages originally
+        intended to be stored in this storage were, in fact, stored and
+        retrieved; e.g., ``(messages, all_retrieved)``.
+
+        **This method must be implemented by a subclass.**
+
+        If it is possible to tell if the backend was not used (as opposed to
+        just containing no messages) then ``None`` should be returned in
+        place of ``messages``.
+        """
+        raise NotImplementedError('subclasses of BaseStorage must provide a _get() method')
+
+    def _store(self, messages, response, *args, **kwargs):
+        """
+        Store a list of messages and return a list of any messages which could
+        not be stored.
+
+        One type of object must be able to be stored, ``Message``.
+
+        **This method must be implemented by a subclass.**
+        """
+        raise NotImplementedError('subclasses of BaseStorage must provide a _store() method')
+
+    def _prepare_messages(self, messages):
+        """
+        Prepare a list of messages for storage.
+        """
+        for message in messages:
+            message._prepare()
+
+    def update(self, response):
+        """
+        Store all unread messages.
+
+        If the backend has yet to be iterated, store previously stored messages
+        again. Otherwise, only store messages added after the last iteration.
+        """
+        self._prepare_messages(self._queued_messages)
+        if self.used:
+            return self._store(self._queued_messages, response)
+        elif self.added_new:
+            messages = self._loaded_messages + self._queued_messages
+            return self._store(messages, response)
+
+    def add(self, level, message, extra_tags=''):
+        """
+        Queue a message to be stored.
+
+        The message is only queued if it contained something and its level is
+        not less than the recording level (``self.level``).
+        """
+        if not message:
+            return
+        # Check that the message level is not less than the recording level.
+        level = int(level)
+        if level < self.level:
+            return
+        # Add the message.
+        self.added_new = True
+        message = Message(level, message, extra_tags=extra_tags)
+        self._queued_messages.append(message)
+
+    def _get_level(self):
+        """
+        Return the minimum recorded level.
+
+        The default level is the ``MESSAGE_LEVEL`` setting. If this is
+        not found, the ``INFO`` level is used.
+        """
+        if not hasattr(self, '_level'):
+            self._level = getattr(settings, 'MESSAGE_LEVEL', constants.INFO)
+        return self._level
+
+    def _set_level(self, value=None):
+        """
+        Set a custom minimum recorded level.
+
+        If set to ``None``, the default level will be used (see the
+        ``_get_level`` method).
+        """
+        if value is None and hasattr(self, '_level'):
+            del self._level
         else:
-            current_path = None
+            self._level = int(value)
 
-        resolved_path = []
-        ns_pattern = ''
-        ns_converters = {}
-        for ns in path:
-            current_ns = current_path.pop() if current_path else None
-            # Lookup the name to see if it could be an app identifier.
-            try:
-                app_list = resolver.app_dict[ns]
-                # Yes! Path part matches an app in the current Resolver.
-                if current_ns and current_ns in app_list:
-                    # If we are reversing for a particular app, use that
-                    # namespace.
-                    ns = current_ns
-                elif ns not in app_list:
-                    # The name isn't shared by one of the instances (i.e.,
-                    # the default) so pick the first instance as the default.
-                    ns = app_list[0]
-            except KeyError:
-                pass
-
-            if ns != current_ns:
-                current_path = None
-
-            try:
-                extra, resolver = resolver.namespace_dict[ns]
-                resolved_path.append(ns)
-                ns_pattern = ns_pattern + extra
-                ns_converters.update(resolver.pattern.converters)
-            except KeyError as key:
-                if resolved_path:
-                    raise NoReverseMatch(
-                        "%s is not a registered namespace inside '%s'" %
-                        (key, ':'.join(resolved_path))
-                    )
-                else:
-                    raise NoReverseMatch("%s is not a registered namespace" % key)
-        if ns_pattern:
-            resolver = get_ns_resolver(ns_pattern, resolver, tuple(ns_converters.items()))
-
-    return resolver._reverse_with_prefix(view, prefix, *args, **kwargs)
-
-
-reverse_lazy = lazy(reverse, str)
-
-
-def clear_url_caches():
-    get_callable.cache_clear()
-    _get_cached_resolver.cache_clear()
-    get_ns_resolver.cache_clear()
-
-
-def set_script_prefix(prefix):
-    """
-    Set the script prefix for the current thread.
-    """
-    if not prefix.endswith('/'):
-        prefix += '/'
-    _prefixes.value = prefix
-
-
-def get_script_prefix():
-    """
-    Return the currently active script prefix. Useful for client code that
-    wishes to construct their own URLs manually (although accessing the request
-    instance is normally going to be a lot cleaner).
-    """
-    return getattr(_prefixes, "value", '/')
-
-
-def clear_script_prefix():
-    """
-    Unset the script prefix for the current thread.
-    """
-    try:
-        del _prefixes.value
-    except AttributeError:
-        pass
-
-
-def set_urlconf(urlconf_name):
-    """
-    Set the URLconf for the current thread (overriding the default one in
-    settings). If urlconf_name is None, revert back to the default.
-    """
-    if urlconf_name:
-        _urlconfs.value = urlconf_name
-    else:
-        if hasattr(_urlconfs, "value"):
-            del _urlconfs.value
-
-
-def get_urlconf(default=None):
-    """
-    Return the root URLconf to use for the current thread if it has been
-    changed from the default one.
-    """
-    return getattr(_urlconfs, "value", default)
-
-
-def is_valid_path(path, urlconf=None):
-    """
-    Return the ResolverMatch if the given path resolves against the default URL
-    resolver, False otherwise. This is a convenience method to make working
-    with "is this a match?" cases easier, avoiding try...except blocks.
-    """
-    try:
-        return resolve(path, urlconf)
-    except Resolver404:
-        return False
-
-
-def translate_url(url, lang_code):
-    """
-    Given a URL (absolute or relative), try to get its translated version in
-    the `lang_code` language (either by i18n_patterns or by translated regex).
-    Return the original URL if no translated version is found.
-    """
-    parsed = urlsplit(url)
-    try:
-        # URL may be encoded.
-        match = resolve(unquote(parsed.path))
-    except Resolver404:
-        pass
-    else:
-        to_be_reversed = "%s:%s" % (match.namespace, match.url_name) if match.namespace else match.url_name
-        with override(lang_code):
-            try:
-                url = reverse(to_be_reversed, args=match.args, kwargs=match.kwargs)
-            except NoReverseMatch:
-                pass
-            else:
-                url = urlunsplit((parsed.scheme, parsed.netloc, url, parsed.query, parsed.fragment))
-    return url
+    level = property(_get_level, _set_level, _set_level)

@@ -1,21 +1,20 @@
-from rest_framework import serializers
-from .models import Bank, Customer
+import pickle
 
-class BankSerializer(serializers.ModelSerializer):
-	class Meta:
-		model = Bank 
-		fields = '__all__'
-
-class CustomerSerializer(serializers.ModelSerializer):
-	class Meta:
-		model = Account
-		fields = '__all__'
-		extra_kwargs = {'password':{'write_only': True}}
-
-	def create(self, validated_data):
-		validated_data['password'] = make_password(validated_data['password'])
-		return super(CustomerSerializer, self).create(validated_data)
+from django.core.signing import JSONSerializer as BaseJSONSerializer
 
 
-if __name__ == '__main__':
-	main()
+class PickleSerializer:
+    """
+    Simple wrapper around pickle to be used in signing.dumps and
+    signing.loads.
+    """
+    protocol = pickle.HIGHEST_PROTOCOL
+
+    def dumps(self, obj):
+        return pickle.dumps(obj, self.protocol)
+
+    def loads(self, data):
+        return pickle.loads(data)
+
+
+JSONSerializer = BaseJSONSerializer
