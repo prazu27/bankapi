@@ -1,16 +1,9 @@
-from django.core.exceptions import BadRequest, SuspiciousOperation
+import warnings
+
+from allauth.core.exceptions import ImmediateHttpResponse
 
 
-class InvalidSessionKey(SuspiciousOperation):
-    """Invalid characters in session key"""
-    pass
+__all__ = ["ImmediateHttpResponse"]
 
 
-class SuspiciousSession(SuspiciousOperation):
-    """The session may be tampered with"""
-    pass
-
-
-class SessionInterrupted(BadRequest):
-    """The session was interrupted."""
-    pass
+warnings.warn("allauth.exceptions is deprecated, use allauth.core.exceptions")

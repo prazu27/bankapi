@@ -1,8 +1,10 @@
 from django.contrib import admin
-from django.contrib.sites.models import Site
+
+from allauth.mfa.models import Authenticator
 
 
-@admin.register(Site)
-class SiteAdmin(admin.ModelAdmin):
-    list_display = ('domain', 'name')
-    search_fields = ('domain', 'name')
+@admin.register(Authenticator)
+class AuthenticatorAdmin(admin.ModelAdmin):
+    raw_id_fields = ("user",)
+    list_display = ("user", "type", "created_at", "last_used_at")
+    list_filter = ("type", "created_at", "last_used_at")
