@@ -1,69 +1,39 @@
+"""
+Views and functions for serving static files. These are only to be used during
+development, and SHOULD NOT be used in a production setting.
+
+"""
+import os
+import posixpath
+
 from django.conf import settings
-from django.contrib.flatpages.models import FlatPage
-from django.contrib.sites.shortcuts import get_current_site
-from django.http import Http404, HttpResponse, HttpResponsePermanentRedirect
-from django.shortcuts import get_object_or_404
-from django.template import loader
-from django.utils.safestring import mark_safe
-from django.views.decorators.csrf import csrf_protect
-
-DEFAULT_TEMPLATE = 'flatpages/default.html'
-
-# This view is called from FlatpageFallbackMiddleware.process_response
-# when a 404 is raised, which often means CsrfViewMiddleware.process_view
-# has not been called even if CsrfViewMiddleware is installed. So we need
-# to use @csrf_protect, in case the template needs {% csrf_token %}.
-# However, we can't just wrap this view; if no matching flatpage exists,
-# or a redirect is required for authentication, the 404 needs to be returned
-# without any CSRF checks. Therefore, we only
-# CSRF protect the internal implementation.
+from django.contrib.staticfiles import finders
+from django.http import Http404
+from django.views import static
 
 
-def flatpage(request, url):
+def serve(request, path, insecure=False, **kwargs):
     """
-    Public interface to the flat page view.
+    Serve static files below a given point in the directory structure or
+    from locations inferred from the staticfiles finders.
 
-    Models: `flatpages.flatpages`
-    Templates: Uses the template defined by the ``template_name`` field,
-        or :template:`flatpages/default.html` if template_name is not defined.
-    Context:
-        flatpage
-            `flatpages.flatpages` object
+    To use, put a URL pattern such as::
+
+        from django.contrib.staticfiles import views
+
+        path('<path:path>', views.serve)
+
+    in your URLconf.
+
+    It uses the django.views.static.serve() view to serve the found files.
     """
-    if not url.startswith('/'):
-        url = '/' + url
-    site_id = get_current_site(request).id
-    try:
-        f = get_object_or_404(FlatPage, url=url, sites=site_id)
-    except Http404:
-        if not url.endswith('/') and settings.APPEND_SLASH:
-            url += '/'
-            f = get_object_or_404(FlatPage, url=url, sites=site_id)
-            return HttpResponsePermanentRedirect('%s/' % request.path)
-        else:
-            raise
-    return render_flatpage(request, f)
-
-
-@csrf_protect
-def render_flatpage(request, f):
-    """
-    Internal interface to the flat page view.
-    """
-    # If registration is required for accessing this page, and the user isn't
-    # logged in, redirect to the login page.
-    if f.registration_required and not request.user.is_authenticated:
-        from django.contrib.auth.views import redirect_to_login
-        return redirect_to_login(request.path)
-    if f.template_name:
-        template = loader.select_template((f.template_name, DEFAULT_TEMPLATE))
-    else:
-        template = loader.get_template(DEFAULT_TEMPLATE)
-
-    # To avoid having to always use the "|safe" filter in flatpage templates,
-    # mark the title and content as already safe (since they are raw HTML
-    # content in the first place).
-    f.title = mark_safe(f.title)
-    f.content = mark_safe(f.content)
-
-    return HttpResponse(template.render({'flatpage': f}, request))
+    if not settings.DEBUG and not insecure:
+        raise Http404
+    normalized_path = posixpath.normpath(path).lstrip('/')
+    absolute_path = finders.find(normalized_path)
+    if not absolute_path:
+        if path.endswith('/') or path == '':
+            raise Http404("Directory indexes are not allowed here.")
+        raise Http404("'%s' could not be found" % path)
+    document_root, path = os.path.split(absolute_path)
+    return static.serve(request, path, document_root=document_root, **kwargs)
